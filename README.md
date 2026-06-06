@@ -4,13 +4,13 @@ Terminal client for **OnlySq Cloud 2.0** (`https://cloud.onlysq.ru`). Talks to t
 
 ## Install
 
-From PyPI (when published):
+From PyPI:
 
 ```bash
 pip install cloud-tc
 ```
 
-Straight from git:
+Straight from git (latest main):
 
 ```bash
 pip install git+https://github.com/xOnlySq/cloud-tc.git
