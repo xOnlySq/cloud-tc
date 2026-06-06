@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 from typing import Optional
@@ -13,6 +14,27 @@ from rich.table import Table
 
 from cloud_tc import __version__
 
+IS_WINDOWS = sys.platform.startswith("win")
+
+
+def _enable_windows_ansi() -> None:
+    if not IS_WINDOWS:
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        for handle_id in (-11, -12):
+            h = kernel32.GetStdHandle(handle_id)
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(h, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(h, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+    except Exception:
+        pass
+
+
+_enable_windows_ansi()
+
 app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
@@ -21,7 +43,35 @@ app = typer.Typer(
 )
 console = Console()
 
-CONFIG_DIR = Path(os.path.expanduser("~")) / ".cloud-tc"
+
+def _config_dir() -> Path:
+    """
+    Cross-platform per-user config directory.
+
+    Windows:  %APPDATA%\\cloud-tc
+    macOS:    ~/Library/Application Support/cloud-tc
+    Linux/*:  $XDG_CONFIG_HOME/cloud-tc, fallback ~/.config/cloud-tc
+
+    Legacy ~/.cloud-tc (used by 0.1.0) is honored if it already exists.
+    """
+    override = os.environ.get("CLOUD_TC_HOME")
+    if override:
+        return Path(override).expanduser()
+
+    legacy = Path.home() / ".cloud-tc"
+    if legacy.exists():
+        return legacy
+
+    if IS_WINDOWS:
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / "cloud-tc"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "cloud-tc"
+    xdg = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(xdg) / "cloud-tc"
+
+
+CONFIG_DIR = _config_dir()
 CONFIG_FILE = CONFIG_DIR / "config.json"
 DEFAULT_BASE = "https://cloud.onlysq.ru"
 
@@ -29,10 +79,11 @@ DEFAULT_BASE = "https://cloud.onlysq.ru"
 def _save(data: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    try:
-        os.chmod(CONFIG_FILE, 0o600)
-    except Exception:
-        pass
+    if not IS_WINDOWS:
+        try:
+            CONFIG_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        except Exception:
+            pass
 
 
 def _load() -> dict:
@@ -48,7 +99,7 @@ def _client(require_auth: bool = True) -> httpx.Client:
     cfg = _load()
     base = cfg.get("base_url") or os.environ.get("TC_BASE_URL") or DEFAULT_BASE
     token = cfg.get("token") or os.environ.get("TC_TOKEN")
-    headers = {"User-Agent": f"cloud-tc/{__version__}"}
+    headers = {"User-Agent": f"cloud-tc/{__version__} ({sys.platform})"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     elif require_auth:
@@ -88,14 +139,15 @@ def _fail_if_bad(r: httpx.Response, ctx: str = "") -> dict:
 
 @app.command()
 def version():
-    console.print(f"cloud-tc [bold]{__version__}[/]")
+    console.print(f"cloud-tc [bold]{__version__}[/] · {sys.platform} · python {sys.version.split()[0]}")
 
 
 @app.command()
 def info():
     cfg = _load()
     console.print(f"[bold]cloud-tc[/] v{__version__}")
-    console.print(f"  config: {CONFIG_FILE}")
+    console.print(f"  platform: {sys.platform}")
+    console.print(f"  config:   {CONFIG_FILE}")
     if cfg:
         console.print(f"  base_url = {cfg.get('base_url', DEFAULT_BASE)}")
         if cfg.get("token"):
@@ -192,6 +244,7 @@ def upload(
     folder_id: Optional[int] = typer.Option(None, "--folder", "-f"),
 ):
     """Upload a local file."""
+    path = path.resolve()
     if not path.is_file():
         console.print("[red]not a file[/]")
         raise typer.Exit(1)
@@ -214,7 +267,8 @@ def download(
     with _client() as cli:
         meta = _fail_if_bad(cli.get(f"/v2/files/{uid}"), "meta")
         name = meta["file"]["name"]
-        target = out or Path(name)
+        target = (out or Path(name)).resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
         with cli.stream("GET", f"/v2/files/{uid}/stream?mode=dl") as r:
             if r.status_code != 200:
                 console.print(f"[red]error[/] HTTP {r.status_code}")
@@ -270,7 +324,7 @@ def mkdir(
 ):
     """Create a folder."""
     with _client() as cli:
-        body = {"name": name}
+        body: dict = {"name": name}
         if parent is not None:
             body["parent_id"] = parent
         data = _fail_if_bad(cli.post("/v2/folders", json=body), "mkdir")
